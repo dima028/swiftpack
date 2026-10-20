@@ -266,6 +266,7 @@ A high-level parallelism improvement is to parallelize the outer loop
 of the correlation nest with `prange`:
 
 | Permutation name          | run 1 | run 2 | run 3 | run 4 | run 5 | avg   |
+|---------------------------|-------|-------|-------|-------|-------|-------|
 | 5_parallel_jii_ij_ijkijij | 1.308 | 1.418 | 1.521 | 1.764 | 1.843 | 1.571 |
 | 5_parallel_jii_ij_ijKijij | 1.392 | 1.995 | 2.195 | 2.324 | 2.141 | 2.009 |
 | 5_parallel_jii_ij_ijkIjij | 1.408 | 1.419 | 2.055 | 2.041 | 2.076 | 1.800 |
@@ -464,9 +465,8 @@ and can be summarized as:
 
 The table summary is:
 
----------------------------------------------------------------------------------------------
 | Baseline Implementation           | GFLOP/s    | Abs Speedup   | Rel Speedup   | Correct  |
----------------------------------------------------------------------------------------------
+|-----------------------------------|------------|---------------|---------------|----------|
 | 0_python_naive                    |      0.002 |         1.00x |         1.00x | PASS     |
 | warmup                            |      0.576 |         5.06x |         5.06x | PASS     |
 | 1_simplified                      |      0.650 |         5.71x |         1.13x | PASS     |
@@ -503,7 +503,6 @@ The table summary is:
 | 6_blocked_parallel                |      3.745 |        32.90x |         1.71x | PASS     |
 | 6_blocked_np_dot                  |     16.219 |       142.47x |         4.33x | PASS     |
 | 7_hoist                           |     12.152 |       106.75x |         0.75x | PASS     |
----------------------------------------------------------------------------------------------
 
 This progression is the core optimization story behind correlation
 in Numba and follows the pattern that `swiftpack` tries to automate.
