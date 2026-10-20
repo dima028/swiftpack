@@ -1,16 +1,19 @@
 # Correlation example
 
-Correlation computation measures how strongly two variables move together, as a number between -1 and 1:
+Correlation computation measures how strongly two variables move together, as a number between -1 and 1. Essentially the _correlation_ between two variables.
 
-+1: they rise and fall together in perfect lockstep (linear relationship).
-0: no linear relationship.
--1: when one rises, the other falls in perfect lockstep.
+Correlation can be defined as:
+- +1: they rise and fall together in perfect lockstep (linear relationship).
+- 0: no linear relationship.
+- -1: when one rises, the other falls in perfect lockstep.
 
-This tutorial has two parts: the first part is code optimization where
-techniques to optimize the correlation
-code are discussed, and the second part discusses how
-those techniques are automated by
-using the `swiftpack` decorator.
+In our example today we are looking at a table with 512 columns (i.e. variables). Classic implementation of correlation in python would require that we compare every column with every other column and fill a 512 x 512 grid. Each cell holds the correlation between two variables. The diagonal is always 1, because a variable would always perfectly match itself. The grid is a mirror image of itself across the diagonal, because “A vs B” is going to have the same correlation value as “B vs A”.
+
+In the code implementation we:
+- calculate mean: to know what the "average" is across all variables so we have a benchmark to compare variables against one another with
+- center data: centers the data around 0 by subtracting the mean from each of the values
+- calculate standard deviation and scale data: work together to adjust the scores to be between +1 and -1
+- iterate over the correlation matrix: compare each pair and assign a score
 
 ## Code optimization
 
