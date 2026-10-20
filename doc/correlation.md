@@ -326,9 +326,7 @@ def correlation_parallel_IJkj_4(data, corr, mean, stddev): #jii ij IJkj
 
 ### 5- loop tiling
 
-The next optimization is loop tiling or blocking. Instead of
-processing the entire matrix in one pass, we
-work on sub-blocks that fit better into cache. Here, we use a helper function to maintain code readability and SRP , but we use the annotation inline='always' to indicate to the compiler that this helper function should actually be treated as inline code rather than a separate function, in order to keep excess overhead costs low.
+The next optimization is loop tiling. Instead of processing the entire matrix in one pass, we work on sub-blocks that fit better into cache. Here, we use a helper function to maintain code readability and SRP , but we use the annotation inline='always' to indicate to the compiler that this helper function should actually be treated as inline code rather than a separate function, in order to keep excess overhead costs low. We use a tile size of 32 as it fits in L1, and is a factor of 512 producing 16 blocks which can distribute the work across 4 cores. Larger tiles may produce fewer tiles and consequently uneven work load across cores. 
 
 ``` python
 @njit(inline='always', fastmath=True)
@@ -420,7 +418,7 @@ result and two copies, so they only pay off when the tile is large enough
 
 ### 6- register tiling
 
-The final optimization keeps a small tile of `corr` in scalar accumulators
+This optimization keeps a small tile of `corr` in scalar accumulators
 for the whole `k` loop, so `corr` is not loaded and stored on every
 iteration. This is implemented in the helper function:
 
@@ -454,9 +452,7 @@ limits vectorization), and gives the compiler fixed trip counts to unroll.
 Each row group mirrors its own finished rows, so no second parallel pass is
 needed.
 
-The overall progression is shown 
-in ![Figure 1](correlation.png) 
-and can be summarized as:
+The overall progression is shown in ![Figure 1](correlation.png) and can be summarized as:
 
 1. correct but slow Python loop nest,
 2. JIT compilation to remove interpreter overhead,
