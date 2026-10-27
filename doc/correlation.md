@@ -493,6 +493,8 @@ Didn't work:
 Potential next steps:
 - replace np.dot with register-tiled 4x4 kernel,
 - find an O(1) way to mirror the upper triangle against the lower triangle (currently O((N/bs)*(M/bs)) = O(N*M/bs^2))
+- remove conditionals in helper and see if iterating over the whole matrix has a better tradeoff than skipping then mirroring
+- implement microkernel in tiles
 
 
 The overall progression is shown in ![Figure 1](correlation.png).
