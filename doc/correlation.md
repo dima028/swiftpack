@@ -85,7 +85,7 @@ The reference result is `np.corrcoef(data, rowvar=False)`. Note that the
 kernel normalizes `data` in place, so the benchmark passes a fresh copy on
 every call.
 
-### 1- numba optimized
+### 1- loop fusion, njit
 
 The first major improvement is to move the computation into Numba
 JIT code:
@@ -137,7 +137,7 @@ the same, but the kernel now runs efficiently on the CPU. This is the
 point at which we see a jump in
 throughput without changing the mathematical structure.
 
-### 2- loop exchange
+### 2- loop order permutations
 
 The next optimization is loop reordering. The naive correlation nest uses
 `i, j, k` order; the benchmark also compares
@@ -240,7 +240,7 @@ determines the stride pattern of memory
 access. Reordering loops is often the simplest way to improve a
 cache-friendly kernel.
 
-### 3- compiler flags
+### 3- compiler flag: fastmath
 
 Once the loop nest is structurally good, the next step is to let the
 backend aggressively optimize it:
@@ -324,7 +324,7 @@ def correlation_parallel_IJkj_4(data, corr, mean, stddev): #jii ij IJkj
     corr[m - 1, m - 1] = 1.0
 ```
 
-### 5- loop tiling
+### 5- tiling parallel
 
 The next optimization is loop tiling. Instead of processing the entire matrix in one pass, we work on sub-blocks that fit better into cache. Here, we use a helper function to maintain code readability and SRP , but we use the annotation inline='always' to indicate to the compiler that this helper function should actually be treated as inline code rather than a separate function, in order to keep excess overhead costs low. We use a tile size of 32 as it fits in L1, and is a factor of 512 producing 16 blocks which can distribute the work across 4 cores. Larger tiles may produce fewer tiles and consequently uneven work load across cores. 
 
@@ -416,9 +416,9 @@ closer to a high-performance BLAS-style kernel, but each tile allocates a
 result and two copies, so they only pay off when the tile is large enough
 (#TODO: report best `BLOCK_SIZE` found).
 
-### 6- register tiling
+### 6- blocking np dot
 
-This optimization keeps a small tile of `corr` in scalar accumulators
+The next optimization keeps a small tile of `corr` in scalar accumulators
 for the whole `k` loop, so `corr` is not loaded and stored on every
 iteration. This is implemented in the helper function:
 
@@ -452,60 +452,53 @@ limits vectorization), and gives the compiler fixed trip counts to unroll.
 Each row group mirrors its own finished rows, so no second parallel pass is
 needed.
 
-The overall progression is shown in ![Figure 1](correlation.png) and can be summarized as:
+### 7- hoist
 
-1. correct but slow Python loop nest,
-2. JIT compilation to remove interpreter overhead,
-3. loop reordering to improve locality,
-4. backend compiler flags for vectorization and reassociation,
-5. parallel outer loop with `prange`,
-6. cache-aware tiling to reduce memory traffic, and
-7. register tiling to cut loads and stores of the output.
+Hoist a simple arithmetic outside of a loop:
+
+```
+@njit(parallel=True, fastmath=True)
+def correlation_hoist_7(data, corr, mean, stddev):
+    n, m = data.shape
+    float_n = float(n)
+    scale = float_n ** 0.5  # we hoist this calculation outside of the center and reduce loop
+    bs = BLOCK_SIZE
+
+    ...
+
+    # Center and reduce the data
+    for i in range(n):
+        for j in range(m):
+            data[i, j] = (data[i, j] - mean[j]) / (scale * stddev[j])
+    ...
+```
+Marginal improvement is seen.
+
+### 8 - vectorization
+Replaced cases of division with inverse multiplication, where possible
+
+### 9 - skip wasted iterations
+Because the correlation matrix is symmetrical, we only need the upper half of the triangle. Iterations over the lower half is redundant, therefore we can skip them.
+
+### 10 - larger tiles
+I used tile sizes 0.5*bs, 2*bs, and 4*bs; however bs was the best result so I rejected this change
+
+## Things that didn't work and things that might
+
+Didn't work:
+- sentinels: there is no padding as the data size 512 is a multiple of batch size 32
+- unrolled k: no impact. i believe this is bc this is sometimes done automatically by the compiler
+- larger and smaller tiles: (0.5x, 2x, 4x) all yielded lower results 
+
+Potential next steps:
+- replace np.dot with register-tiled 4x4 kernel,
+- find an O(1) way to mirror the upper triangle against the lower triangle (currently O((N/bs)*(M/bs)) = O(N*M/bs^2))
+
+
+The overall progression is shown in ![Figure 1](correlation.png).
 
 The table summary is:
+![Figure 2](bench_results.png)
 
-| Baseline Implementation           | GFLOP/s    | Abs Speedup   | Rel Speedup   | Correct  |
-|-----------------------------------|------------|---------------|---------------|----------|
-| 0_python_naive                    |      0.002 |         1.00x |         1.00x | PASS     |
-| warmup                            |      0.576 |         5.06x |         5.06x | PASS     |
-| 1_simplified                      |      0.650 |         5.71x |         1.13x | PASS     |
-| 3_order_1and2_jii                 |      0.647 |         5.69x |         1.00x | PASS     |
-| 3_order_1and2_ij_ji               |      0.616 |         5.41x |         0.95x | PASS     |
-| 3_order_1and2_ji_ij               |      0.631 |         5.55x |         1.02x | PASS     |
-| 3_order_1and2_ij_ij               |      0.604 |         5.30x |         0.96x | PASS     |
-| 3_order_3_ij                      |      0.635 |         5.58x |         1.05x | PASS     |
-| 3_order_3_ji                      |      0.533 |         4.68x |         0.84x | PASS     |
-| 3_order_1and2and3_jiii            |      0.469 |         4.12x |         0.88x | PASS     |
-| 3_order_4_ijk                     |      0.525 |         4.61x |         1.12x | PASS     |
-| 3_order_4_ikj                     |      0.901 |         7.92x |         1.72x | PASS     |
-| 3_order_4_jik                     |      0.342 |         3.00x |         0.38x | PASS     |
-| 3_order_4_jki                     |      0.306 |         2.69x |         0.90x | PASS     |
-| 3_order_4_kij                     |      1.058 |         9.29x |         3.45x | PASS     |
-| 3_order_4_kji                     |      0.325 |         2.85x |         0.31x | PASS     |
-| 4_fastmath                        |      1.339 |        11.76x |         4.12x | PASS     |
-| 5_parallel_jii_ij_ijkijij         |      1.217 |        10.69x |         0.91x | PASS     |
-| 5_parallel_Jii_ij_ijkijij         |      0.817 |         7.17x |         0.67x | PASS     |
-| 5_parallel_jIi_ij_ijkijij         |      0.747 |         6.56x |         0.91x | PASS     |
-| 5_parallel_jiI_ij_ijkijij         |      0.700 |         6.15x |         0.94x | PASS     |
-| 5_parallel_jii_Ij_ijkijij         |      0.760 |         6.68x |         1.09x | PASS     |
-| 5_parallel_jii_iJ_ijkijij         |      0.727 |         6.39x |         0.96x | PASS     |
-| 5_parallel_jii_ij_Ijkijij         |      0.800 |         7.03x |         1.10x | PASS     |
-| 5_parallel_jii_ij_iJkijij         |      0.736 |         6.47x |         0.92x | PASS     |
-| 5_parallel_jii_ij_ijKijij         |      1.300 |        11.42x |         1.77x | PASS     |
-| 5_parallel_jii_ij_ijkIjij         |      1.922 |        16.88x |         1.48x | PASS     |
-| 5_parallel_jii_ij_ijkiJij         |      0.024 |         0.21x |         0.01x | PASS     |
-| 5_parallel_jii_ij_ijkijIj         |      0.852 |         7.49x |        35.76x | PASS     |
-| 5_parallel_jii_ij_ijkijiJ         |      0.836 |         7.34x |         0.98x | PASS     |
-| 5_parallel_jii_ij_ijKIjij         |      2.279 |        20.02x |         2.73x | PASS     |
-| 5_parallel_jii_ij_Ijkj            |      2.259 |        19.85x |         0.99x | PASS     |
-| 5_parallel_jii_ij_IJkj            |      2.190 |        19.24x |         0.97x | PASS     |
-| 6_blocked_parallel                |      3.745 |        32.90x |         1.71x | PASS     |
-| 6_blocked_np_dot                  |     16.219 |       142.47x |         4.33x | PASS     |
-| 7_hoist                           |     12.152 |       106.75x |         0.75x | PASS     |
-
-This progression is the core optimization story behind correlation
-in Numba and follows the pattern that `swiftpack` tries to automate.
-
-## Automation
-
-#TODO: describe how the `swiftpack` decorator automates these steps for correlation
+Finally, we can see from the roofline model that this work is memory bound and would benefit from better tiling or otherwise reusing data:
+![Figure 3](roofline_model.png)

@@ -4,6 +4,7 @@ import time
 import matplotlib.pyplot as plt
 from numba import njit, prange, get_num_threads
 import numpy as np
+import math
 
 # Set single-threaded execution for external BLAS libraries to ensure reproducible benchmarks
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -623,7 +624,7 @@ def correlation_opt_flags_3(data, corr, mean, stddev): #j(ii) ji kij
 # ---------------------------------------------------------
 # Baseline 4: Parallel Loop Versions
 # ---------------------------------------------------------
-@njit(parallel=True, fastmath=True)
+@njit(parallel=False, fastmath=True)
 def correlation_parallel_jii_ij_kij_4(data, corr, mean, stddev):
     n, m = data.shape
     float_n = float(n)
@@ -1325,26 +1326,26 @@ def correlation_parallel_IJkj_4(data, corr, mean, stddev): #jii ij IJkj
 @njit(inline='always', fastmath=True)
 def _block_helper(data, corr, b, bs):
     n, m = data.shape
-    i0 = b * bs
-    i1 = min(i0 + bs, m)
+    i0 = b * bs #starting index of row for corr
+    i1 = min(i0 + bs, m) #ending index of row for corr
 
     # Diagonal and zero accumulators for this block's rows
     for i in range(i0, i1):
-        corr[i, i] = 1.0
+        corr[i, i] = 1.0 # diagonal cells = 1
         for j in range(i + 1, m):
-            corr[i, j] = 0.0
+            corr[i, j] = 0.0 # init cells of upper triangle to 0
 
     # Tiled i, k, j accumulation (upper triangle only)
-    for k0 in range(0, n, bs):
-        k1 = min(k0 + bs, n)
-        for j0 in range(i0, m, bs):
-            j1 = min(j0 + bs, m)
-            for i in range(i0, i1):
-                js = max(j0, i + 1)
-                for k in range(k0, k1):
-                    dki = data[k, i]
-                    for j in range(js, j1):
-                        corr[i, j] += dki * data[k, j]
+    for k0 in range(0, n, bs): # tiled k
+        k1 = min(k0 + bs, n) 
+        for j0 in range(i0, m, bs): # tiled j; start at i0 bc upper triangle only
+            j1 = min(j0 + bs, m) 
+            for i in range(i0, i1): # all i (not tiled); start at i0 bc upper triangle only
+                js = max(j0, i + 1) # ensures j > i so upper triangle only
+                for k in range(k0, k1): #for each item in chunk
+                    dki = data[k, i] #load scalar
+                    for j in range(js, j1): #for each column
+                        corr[i, j] += dki * data[k, j] #multiply and add (i.e. we're building the dot product)
 
 @njit(parallel=True, fastmath=True)
 def correlation_blocked_parallel_5(data, corr, mean, stddev):
@@ -1374,17 +1375,18 @@ def correlation_blocked_parallel_5(data, corr, mean, stddev):
             data[i, j] /= (float_n ** 0.5) * stddev[j]
 
     # Correlation matrix (upper triangle, mirrored)
-    nb = (m + bs - 1) // bs
+    nb = (m + bs - 1) // bs #number of blocks
 
-    # Parallel over I blocks. Pair block p (most work) with block nb-1-p
-    # (least work) so every iteration costs about the same.
+    # Parallel over I blocks: since the rows are uneven as
+    # we're working over a triangle; we pair block p (most work) 
+    # with block nb-1-p (least work) so every iteration is ~ the same.
     for p in prange((nb + 1) // 2):
         _block_helper(data, corr, p, bs)
         q = nb - 1 - p
         if q != p:
             _block_helper(data, corr, q, bs)
 
-    # Tiled mirror: thread b writes only columns i0..i1 of the lower triangle
+    # Tiled mirror: filling in the lower triangle for matrix correctness
     for b in prange(nb):
         i0 = b * bs
         i1 = min(i0 + bs, m)
@@ -1411,10 +1413,11 @@ def _block_helper_np_dot(data, corr, b, bs):
     for k0 in range(0, n, bs):
         k1 = min(k0 + bs, n)
 
-        # Contiguous transposed tile, built once per k block and reused across j tiles
-        a_t = np.ascontiguousarray(data[k0:k1, i0:i1].T)
+        # transposed tile as continguous array for np.dot
+        # built once per k block and reused across j tiles
+        a_t = np.ascontiguousarray(data[k0:k1, i0:i1].T) 
 
-        for j0 in range(i0, m, bs):
+        for j0 in range(i0, m, bs): # move right across the matrix, starting at the diagonal
             j1 = min(j0 + bs, m)
             b_tile = np.ascontiguousarray(data[k0:k1, j0:j1])
             corr[i0:i1, j0:j1] += np.dot(a_t, b_tile)
@@ -1473,7 +1476,7 @@ def correlation_blocked_np_dot_6(data, corr, mean, stddev):
 def correlation_hoist_7(data, corr, mean, stddev):
     n, m = data.shape
     float_n = float(n)
-    scale = float_n ** 0.5
+    scale = float_n ** 0.5 # hoisting out this calculation to save m*n operations
     bs = BLOCK_SIZE
 
     for j in range(m):
@@ -1499,6 +1502,59 @@ def correlation_hoist_7(data, corr, mean, stddev):
     # Correlation matrix (upper triangle, mirrored)
     nb = (m + bs - 1) // bs
 
+    # Parallel over I blocks, pairing heavy block p with light block nb-1-p
+    for p in prange((nb + 1) // 2):
+        _block_helper_np_dot(data, corr, p, bs)
+        q = nb - 1 - p
+        if q != p:
+            _block_helper_np_dot(data, corr, q, bs)
+
+    # Tiled mirror. This also overwrites the stray lower-triangle cells
+    # that np.dot computed inside the diagonal tiles.
+    for b in prange(nb):
+        i0 = b * bs
+        i1 = min(i0 + bs, m)
+        for i in range(i0, i1):
+            corr[i, i] = 1.0
+            for j in range(i + 1, m):
+                corr[j, i] = corr[i, j]
+
+# ----
+# 8 - vectorization
+# ----
+@njit(parallel=True, fastmath=True)
+def correlation_vector_8(data, corr, mean, stddev):
+    n, m = data.shape
+    float_n = float(n)
+    inv_float_n = 1 / float_n
+    scale = float_n ** 0.5
+    bs = BLOCK_SIZE
+    inv = np.empty(m)
+
+    for j in range(m):
+        # column means
+        s = 0.0
+        for i in range(n):
+            s += data[i, j]
+        mean[j] = s * inv_float_n # multiplying vectorizes cleaner than dividing
+
+        # column std devs
+        s = 0.0
+        for i in range(n):
+            d = data[i, j] - mean[j]
+            s += d * d
+        s = (s * inv_float_n) ** 0.5 # multiplying vectorizes cleaner than dividing
+        stddev[j] = 1.0 if s <= EPS else s
+        inv[j] = 1.0 / (scale * stddev[j]) # multiplying vectorizes cleaner than dividing
+
+    # Center and reduce the data
+    for i in range(n):
+        for j in range(m):
+            data[i, j] = (data[i, j] - mean[j]) * inv[j] # multiplying vectorizes cleaner than dividing
+
+    # Correlation matrix (upper triangle, mirrored)
+    nb = (m + bs - 1) // bs
+
         # Parallel over I blocks, pairing heavy block p with light block nb-1-p
     for p in prange((nb + 1) // 2):
         _block_helper_np_dot(data, corr, p, bs)
@@ -1516,44 +1572,174 @@ def correlation_hoist_7(data, corr, mean, stddev):
             for j in range(i + 1, m):
                 corr[j, i] = corr[i, j]
 
+# ------
+# 9 - skip wasted iters in helper
+# ------
+@njit(inline='always', fastmath=True)
+def _block_helper_skip_iters(data, corr, b, bs):
+    n, m = data.shape
+    i0 = b * bs
+    i1 = min(i0 + bs, m)
+
+    for i in range(i0, i1):
+        corr[i, i] = 1.0 # set diagonal to 0
+        for j in range(i + 1, m):
+            corr[i, j] = 0.0
+
+    for k0 in range(0, n, bs):
+        k1 = min(k0 + bs, n)
+        for j0 in range(i0, m, bs):
+            j1 = min(j0 + bs, m)
+            for i in range(i0, i1):
+                js = max(j0, i + 1) # only perform upper triangle, then mirror
+                for k in range(k0, k1):
+                    dik = data[k, i]
+                    for j in range(js, j1):
+                        corr[i, j] += dik * data[k, j]
+
+@njit(parallel=True, fastmath=True)
+def correlation_skip_iters_9(data, corr, mean, stddev):
+    n, m = data.shape
+    float_n = float(n)
+    inv_float_n = 1 / float_n
+    scale = float_n ** 0.5
+    bs = BLOCK_SIZE
+    inv = np.empty(m)
+
+    for j in range(m):
+        # column means
+        s = 0.0
+        for i in range(n):
+            s += data[i, j]
+        mean[j] = s * inv_float_n # multiplying vectorizes cleaner than dividing
+
+        # column std devs
+        s = 0.0
+        for i in range(n):
+            d = data[i, j] - mean[j]
+            s += d * d
+        s = (s * inv_float_n) ** 0.5 # multiplying vectorizes cleaner than dividing
+        stddev[j] = 1.0 if s <= EPS else s
+        inv[j] = 1.0 / (scale * stddev[j]) # multiplying vectorizes cleaner than dividing
+
+    # Center and reduce the data
+    for i in range(n):
+        for j in range(m):
+            data[i, j] = (data[i, j] - mean[j]) * inv[j] # multiplying vectorizes cleaner than dividing
+
+    # Correlation matrix (upper triangle, mirrored)
+    nb = (m + bs - 1) // bs
+
+        # Parallel over I blocks, pairing heavy block p with light block nb-1-p
+    for p in prange((nb + 1) // 2):
+        _block_helper_np_dot(data, corr, p, bs)
+        q = nb - 1 - p
+        if q != p:
+            _block_helper_np_dot(data, corr, q, bs)
+
+    # Tiled mirror. This also overwrites the stray lower-triangle cells
+    # that np.dot computed inside the diagonal tiles.
+    for b in prange(nb):
+        i0 = b * bs
+        i1 = min(i0 + bs, m)
+        for i in range(i0, i1):
+            corr[i, i] = 1.0
+            for j in range(i + 1, m):
+                corr[j, i] = corr[i, j]
+
+# --------------
+# 10 - 4 x tiles
+# --------------
+@njit(parallel=True, fastmath=True)
+def correlation_larger_tile_10(data, corr, mean, stddev):
+    n, m = data.shape
+    float_n = float(n)
+    inv_float_n = 1 / float_n
+    scale = float_n ** 0.5
+    bs = int(BLOCK_SIZE * 4)
+    inv = np.empty(m)
+
+    for j in range(m):
+        # column means
+        s = 0.0
+        for i in range(n):
+            s += data[i, j]
+        mean[j] = s * inv_float_n # multiplying vectorizes cleaner than dividing
+
+        # column std devs
+        s = 0.0
+        for i in range(n):
+            d = data[i, j] - mean[j]
+            s += d * d
+        s = (s * inv_float_n) ** 0.5 # multiplying vectorizes cleaner than dividing
+        stddev[j] = 1.0 if s <= EPS else s
+        inv[j] = 1.0 / (scale * stddev[j]) # multiplying vectorizes cleaner than dividing
+
+    # Center and reduce the data
+    for i in range(n):
+        for j in range(m):
+            data[i, j] = (data[i, j] - mean[j]) * inv[j] # multiplying vectorizes cleaner than dividing
+
+    # Correlation matrix (upper triangle, mirrored)
+    nb = (m + bs - 1) // bs
+
+        # Parallel over I blocks, pairing heavy block p with light block nb-1-p
+    for p in prange((nb + 1) // 2):
+        _block_helper_np_dot(data, corr, p, bs)
+        q = nb - 1 - p
+        if q != p:
+            _block_helper_np_dot(data, corr, q, bs)
+
+    # Tiled mirror. This also overwrites the stray lower-triangle cells
+    # that np.dot computed inside the diagonal tiles.
+    for b in prange(nb):
+        i0 = b * bs
+        i1 = min(i0 + bs, m)
+        for i in range(i0, i1):
+            corr[i, i] = 1.0
+            for j in range(i + 1, m):
+                corr[j, i] = corr[i, j]
+
+
+
 baseline_functions = [
-    ("warmup", correlation_python_simplified),
     ("1_simplified", correlation_python_simplified),
-    #("1_simplified-noloops", correlation_python_simplified_noloops),
-    #("2_numba_naive", correlation_numba_1),
-    ("3_order_1and2_jii", correlation_2_jii_ij_ijk),
-    ("3_order_1and2_ij_ji", correlation_2_ij_ji_ij_ijk),
-    ("3_order_1and2_ji_ij", correlation_2_ji_ij_ij_ijk),
-    ("3_order_1and2_ij_ij", correlation_2_ij_ij_ij_ijk),
-    ("3_order_3_ij", correlation_2_jii_ij_ijk),
-    ("3_order_3_ji", correlation_2_jii_ji_ijk),
-    ("3_order_1and2and3_jiii", correlation_2_ji_ijk),
-    ("3_order_4_ijk", correlation_2_ji_ij_ijk),
-    ("3_order_4_ikj", correlation_2_ji_ij_ikj),
-    ("3_order_4_jik", correlation_2_ji_ij_jik),
-    ("3_order_4_jki", correlation_2_ji_ij_jki),
-    ("3_order_4_kij", correlation_2_ji_ij_kij),
-    ("3_order_4_kji", correlation_2_ji_ij_kji),
-    ("4_fastmath", correlation_opt_flags_3),
-    ("5_parallel_jii_ij_ijkijij", correlation_parallel_jii_ij_kij_4),
-    ("5_parallel_Jii_ij_ijkijij", correlation_parallel_Jii_ij_4),
-    ("5_parallel_jIi_ij_ijkijij", correlation_parallel_jIi_ij_4),
-    ("5_parallel_jiI_ij_ijkijij", correlation_parallel_jiI_ij_4),
-    ("5_parallel_jii_Ij_ijkijij", correlation_parallel_jii_Ij_4),
-    ("5_parallel_jii_iJ_ijkijij", correlation_parallel_jii_iJ_4),
-    ("5_parallel_jii_ij_Ijkijij", correlation_parallel_Ijkijij_4),
-    ("5_parallel_jii_ij_iJkijij", correlation_parallel_iJkijij_4),
-    ("5_parallel_jii_ij_ijKijij", correlation_parallel_ijKijij_4),
-    ("5_parallel_jii_ij_ijkIjij", correlation_parallel_ijkIjij_4),
-    ("5_parallel_jii_ij_ijkiJij", correlation_parallel_ijkiJij_4),
-    ("5_parallel_jii_ij_ijkijIj", correlation_parallel_ijkijIj_4),
-    ("5_parallel_jii_ij_ijkijiJ", correlation_parallel_ijkijiJ_4),
-    ("5_parallel_jii_ij_ijKIjij", correlation_parallel_jii_ij_kij_ikKIjij_4),
-    ("5_parallel_jii_ij_Ijkj", correlation_parallel_Ijkj_4),
-    ("5_parallel_jii_ij_IJkj", correlation_parallel_IJkj_4),
-    ("6_blocked_parallel", correlation_blocked_parallel_5),
+    ("2_order_1and2_jii", correlation_2_jii_ij_ijk),
+    ("2_order_1and2_ij_ji", correlation_2_ij_ji_ij_ijk),
+    ("2_order_1and2_ji_ij", correlation_2_ji_ij_ij_ijk),
+    ("2_order_1and2_ij_ij", correlation_2_ij_ij_ij_ijk),
+    ("2_order_3_ij", correlation_2_jii_ij_ijk),
+    ("2_order_3_ji", correlation_2_jii_ji_ijk),
+    ("2_order_1and2and3_jiii", correlation_2_ji_ijk),
+    ("2_order_4_ijk", correlation_2_ji_ij_ijk),
+    ("2_order_4_ikj", correlation_2_ji_ij_ikj),
+    ("2_order_4_jik", correlation_2_ji_ij_jik),
+    ("2_order_4_jki", correlation_2_ji_ij_jki),
+    ("2_order_4_kij", correlation_2_ji_ij_kij),
+    ("2_order_4_kji", correlation_2_ji_ij_kji),
+    ("3_fastmath", correlation_opt_flags_3),
+    ("4_parallel_jii_ij_ijkijij", correlation_parallel_jii_ij_kij_4),
+    ("4_parallel_Jii_ij_ijkijij", correlation_parallel_Jii_ij_4),
+    ("4_parallel_jIi_ij_ijkijij", correlation_parallel_jIi_ij_4),
+    ("4_parallel_jiI_ij_ijkijij", correlation_parallel_jiI_ij_4),
+    ("4_parallel_jii_Ij_ijkijij", correlation_parallel_jii_Ij_4),
+    ("4_parallel_jii_iJ_ijkijij", correlation_parallel_jii_iJ_4),
+    ("4_parallel_jii_ij_Ijkijij", correlation_parallel_Ijkijij_4),
+    ("4_parallel_jii_ij_iJkijij", correlation_parallel_iJkijij_4),
+    ("4_parallel_jii_ij_ijKijij", correlation_parallel_ijKijij_4),
+    ("4_parallel_jii_ij_ijkIjij", correlation_parallel_ijkIjij_4),
+    ("4_parallel_jii_ij_ijkiJij", correlation_parallel_ijkiJij_4),
+    ("4_parallel_jii_ij_ijkijIj", correlation_parallel_ijkijIj_4),
+    ("4_parallel_jii_ij_ijkijiJ", correlation_parallel_ijkijiJ_4),
+    ("4_parallel_jii_ij_ijKIjij", correlation_parallel_jii_ij_kij_ikKIjij_4),
+    ("4_parallel_jii_ij_Ijkj", correlation_parallel_Ijkj_4),
+    ("4_parallel_jii_ij_IJkj", correlation_parallel_IJkj_4),
+    ("5_blocked_parallel", correlation_blocked_parallel_5),
     ("6_blocked_np_dot", correlation_blocked_np_dot_6),
     ("7_hoist", correlation_hoist_7),
+    ("8_vectorization", correlation_vector_8),
+    ("9_skip_iters", correlation_skip_iters_9),
+    ("10_larger_tiles", correlation_larger_tile_10),
 ]
 
 # ---------------------------------------------------------
@@ -1631,8 +1817,8 @@ def run_benchmark(matrix_size=512):
 
     #print("num threads ", get_num_threads())
     #print("cpu cores ", os.cpu_count())
-    return results
 
+    return results
 # ---------------------------------------------------------
 # Formatting and Output Execution
 # ---------------------------------------------------------
