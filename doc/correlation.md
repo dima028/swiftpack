@@ -88,7 +88,7 @@ every call.
 ### 1- loop fusion, njit
 
 The first major improvement is to move the computation into Numba
-JIT code:
+JIT code by using the `@njit` decorator:
 
 ```python
 @njit
