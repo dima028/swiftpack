@@ -503,4 +503,4 @@ The table summary is:
 ![Figure 2](bench_results.png)
 
 Finally, we can see from the roofline model that this work is memory bound and would benefit from better tiling or otherwise reusing data:
-![Figure 3](roofline_model.png)
+![Figure 3](roofline.png)
